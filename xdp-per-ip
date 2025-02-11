@@ -1,0 +1,97 @@
+// @license
+ // Copyright (C) 2025  MortyTech
+ // License: MIT
+
+ //go:build ignore
+
+ #include <linux/bpf.h>
+ #include <linux/if_ether.h>
+ #include <linux/ip.h>
+ #include <stddef.h>
+ #include <bpf/bpf_endian.h>
+ #include <bpf/bpf_helpers.h>
+
+ #define TARGET_IP 0x37614FB9 //  (IP addr in little-endian)
+ #define  1         // جهت مقصد
+ #define SEC_PER_NS 1000000000 // 1 second in nanoseconds
+
+ // Map برای ذخیره آمار ثانیه جاری
+ struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, __u64);
+ } current_stats SEC(".maps");
+
+ // Map برای ذخیره آمار ثانیه قبل (در این نسخه استفاده نمی‌شود)
+ struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, __u64);
+ } previous_stats SEC(".maps");
+
+ // Map برای ذخیره timestamp آخرین محاسبه
+ struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, __u64);
+ } timestamp_map SEC(".maps");
+
+ SEC("xdp")
+ int xdp_count_bytes(struct xdp_md *xdp) {
+  void *data = (void *)(long)xdp->data;
+  void *data_end = (void *)(long)xdp->data_end;
+
+  struct ethhdr *eth = data;
+  if ((void *)eth + sizeof(*eth) > data_end)
+   return XDP_PASS;
+
+  if (eth->h_proto != bpf_htons(ETH_P_IP))
+   return XDP_PASS;
+
+  struct iphdr *ip4 = (void *)eth + sizeof(*eth);
+  if ((void *)ip4 + sizeof(*ip4) > data_end)
+   return XDP_PASS;
+
+  // فقط ترافیک مقصد
+  if (ip4->daddr != TARGET_IP)
+   return XDP_PASS;
+
+  __u32 key = ;
+  __u64 pkt_len = data_end - data;
+  __u64 *bytes = bpf_map_lookup_elem(&current_stats, &key);
+
+  if (bytes)
+   __sync_fetch_and_add(bytes, pkt_len);
+  else
+   bpf_map_update_elem(&current_stats, &key, &pkt_len, BPF_NOEXIST);
+
+  // منطق محاسبه میزان مصرف در هر ثانیه
+  __u32 ts_key = 0;
+  __u64 *ts, now, delta_ns;
+
+  now = bpf_ktime_get_ns();
+  ts = bpf_map_lookup_elem(&timestamp_map, &ts_key);
+  if (!ts) {
+   bpf_map_update_elem(&timestamp_map, &ts_key, &now, BPF_ANY);
+   return XDP_PASS;
+  }
+
+  delta_ns = now - *ts;
+
+  if (delta_ns >= SEC_PER_NS) {
+   __u64 zero = 0;
+
+   // ریست کردن current_stats برای شروع شمارش ثانیه جدید
+   bpf_map_update_elem(&current_stats, &key, &zero, BPF_ANY);
+
+   // به‌روزرسانی timestamp برای ثانیه جاری
+   bpf_map_update_elem(&timestamp_map, &ts_key, &now, BPF_ANY);
+  }
+
+  return XDP_PASS;
+ }
+
+ char __license[] SEC("license") = "MIT";
